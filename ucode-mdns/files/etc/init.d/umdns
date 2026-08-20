@@ -1,0 +1,74 @@
+#!/bin/sh /etc/rc.common
+
+START=80
+
+USE_PROCD=1
+PROG=/usr/bin/ucode
+SCRIPT=/usr/share/umdnsd/ucode-mdns.uc
+MODULES="mdns uci ubus fs log math uloop"
+
+start_service() {
+	local network="$(uci -q get umdns.@umdns[-1].network)"
+	local jail="$(uci -q get umdns.@umdns[-1].jail)"
+	local n
+
+	procd_open_instance
+	procd_set_param command "$PROG" -L '/usr/share/umdnsd/*.uc' "$SCRIPT"
+	[ -f /etc/seccomp/ucode-mdns.json ] && procd_set_param seccomp /etc/seccomp/ucode-mdns.json
+	procd_set_param respawn
+	procd_set_param stderr 1
+
+	procd_open_data
+	json_add_array firewall
+
+	for n in $network; do
+		json_add_object ""
+		json_add_string type rule
+		json_add_string proto udp
+		json_add_string src "$n"
+		json_add_int dest_port 5353
+		json_add_string target ACCEPT
+		json_close_object
+	done
+
+	json_close_array
+	procd_close_data
+
+	procd_open_trigger
+	procd_add_config_trigger "config.change" "umdns" /etc/init.d/umdns reload
+	for n in $network; do
+		procd_add_interface_trigger "interface.*" $n /etc/init.d/umdns reload
+	done
+	procd_add_raw_trigger "instance.update" 5000 "/bin/ubus" "call" "umdns" "reload"
+	procd_close_trigger
+
+	[ "$jail" = 1 ] && {
+		local mod lib
+
+		procd_add_jail umdns ubus log
+		procd_add_jail_mount /usr/share/umdnsd
+		procd_add_jail_mount /etc/umdns
+		procd_add_jail_mount /etc/config/umdns
+
+		for mod in $MODULES; do
+			[ -f "/usr/lib/ucode/$mod.so" ] || continue
+
+			procd_add_jail_mount "/usr/lib/ucode/$mod.so"
+
+			for lib in $(ldd "/usr/lib/ucode/$mod.so" 2>/dev/null | sed -n 's/.*=> \(\/[^ ]*\).*/\1/p'); do
+				procd_add_jail_mount "$lib"
+			done
+		done
+	}
+
+	procd_close_instance
+}
+
+reload_service() {
+	rc_procd start_service
+	ubus call umdns reload
+}
+
+service_running() {
+	ubus -t 10 wait_for umdns
+}

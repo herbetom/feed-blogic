@@ -1,0 +1,5 @@
+#!/bin/sh
+
+cp /etc/config/lldp /etc/uconfig/shadow/
+uci -c /etc/uconfig/shadow/ delete lldp.@global[0].device
+uci -c /etc/uconfig/shadow/ commit lldp

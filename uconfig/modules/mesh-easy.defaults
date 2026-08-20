@@ -1,0 +1,20 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+SHADOW=/etc/uconfig/shadow
+touch $SHADOW/umapd
+
+board=$(board_name)
+
+setup_button() {
+	uci -c $SHADOW add umapd button
+	uci -c $SHADOW set umapd.@button[-1].wps_button="$1"
+	uci -c $SHADOW commit
+}
+
+case "$board" in
+        openwrt,one)
+                setup_button BTN_0
+                ;;
+esac

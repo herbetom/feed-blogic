@@ -1,0 +1,15 @@
+{
+	"umdns": {
+		"description": "Grant access to mDNS service discovery",
+		"read": {
+			"ubus": {
+				"umdns": [ "announcements", "browse", "fetch", "hosts", "query", "stats" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"umdns": [ "reload", "set_config", "update" ]
+			}
+		}
+	}
+}

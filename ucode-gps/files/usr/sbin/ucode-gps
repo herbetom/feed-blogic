@@ -1,0 +1,664 @@
+#!/usr/bin/env ucode
+
+/*
+ * SPDX-License-Identifier: GPL-2.0-only
+ *
+ * Copyright (C) 2026 John Crispin <john@phrozen.org>
+ */
+
+/*
+ * NMEA GPS daemon. The ubus interface is compatible with ugps, so the object
+ * name, the method name and every key ugps publishes keep their meaning and
+ * their type. All other keys are additions.
+ */
+
+import * as uloop from 'uloop';
+import * as ubus from 'ubus';
+import * as tty from 'tty';
+import * as log from 'log';
+
+const MAX_TIME_OFFSET = 5;
+const MAX_BAD_TIME = 3;
+
+const TALKER_SYSTEM = {
+	GP: "gps",
+	GL: "glonass",
+	GA: "galileo",
+	GB: "beidou",
+	BD: "beidou",
+	GQ: "qzss"
+};
+
+const TXT_SEVERITY = [ "ERROR", "WARNING", "NOTICE" ];
+
+const FIX_MODE = {
+	[1]: "none",
+	[2]: "2D",
+	[3]: "3D"
+};
+
+let debug_level = 0;
+let adjust_clock = false;
+let bad_time = 0;
+
+/*
+ * Positions are formatted like ugps formats them, everything else is the raw
+ * NMEA field, so that a consumer of ugps sees exactly the same strings.
+ */
+let gps_data = {};
+let gnss = {};
+
+let stamp;            /* Monotonic seconds of the last position fix */
+let valid = false;    /* Receiver reports a usable signal */
+let gsa_run = false;  /* Inside a run of GSA sentences */
+let gsv_run = false;  /* Inside a run of GSV sentences */
+let gsv_counts = {};  /* Satellites in view, per talker, for the current run */
+
+/* ulog does not terminate the line itself */
+function debug_msg(level, msg) {
+	if (debug_level >= level)
+		log.ulog(log.LOG_DEBUG, "%s\n", msg);
+}
+
+function error_msg(msg) {
+	log.ulog(log.LOG_ERR, "%s\n", msg);
+}
+
+function notice_msg(msg) {
+	log.ulog(log.LOG_NOTICE, "%s\n", msg);
+}
+
+function gnss_reset() {
+	gnss = {
+		gps: { active: 0, in_view: 0 },
+		glonass: { active: 0, in_view: 0 },
+		galileo: { active: 0, in_view: 0 },
+		beidou: { active: 0, in_view: 0 },
+		qzss: { active: 0, in_view: 0 },
+		other: { active: 0, in_view: 0 }
+	};
+}
+
+/*
+ * A constellation specific talker names the system directly. A mixed GN talker
+ * does not, so fall back to the NMEA 4.10 satellite number ranges.
+ */
+function system_get(talker, prn) {
+	let system = TALKER_SYSTEM[talker];
+
+	if (system)
+		return system;
+
+	if (prn >= 1 && prn <= 32)
+		return "gps";
+	if (prn >= 65 && prn <= 96)
+		return "glonass";
+	if (prn >= 193 && prn <= 200)
+		return "qzss";
+	if (prn >= 201 && prn <= 237)
+		return "beidou";
+	if (prn >= 301 && prn <= 336)
+		return "galileo";
+
+	return "other";
+}
+
+function nmea_checksum(payload) {
+	let sum = 0;
+
+	for (let i = 0; i < length(payload); i++)
+		sum ^= ord(payload, i);
+
+	return sprintf("%02X", sum);
+}
+
+/* Returns the payload between the leading $ and the checksum, or null */
+function nmea_verify(sentence) {
+	if (substr(sentence, 0, 1) != "$")
+		return null;
+
+	let star = rindex(sentence, "*");
+	if (star < 0)
+		return null;
+
+	let payload = substr(sentence, 1, star - 1);
+
+	/* Receivers differ on the case of the checksum digits */
+	if (nmea_checksum(payload) != uc(trim(substr(sentence, star + 1))))
+		return null;
+
+	return payload;
+}
+
+/* DDMM.MMMM and DDDMM.MMMM both, without guessing from the string length */
+function coord_parse(value, hemisphere) {
+	if (!value || !hemisphere)
+		return null;
+
+	let raw = +value;
+
+	if (raw != raw)
+		return null;
+
+	let degrees = int(raw / 100);
+	let decimal = degrees + (raw - degrees * 100) / 60.0;
+
+	if (hemisphere == "S" || hemisphere == "W")
+		decimal = -decimal;
+
+	return decimal;
+}
+
+function position_set(lat_field, lat_hem, lon_field, lon_hem) {
+	let lat = coord_parse(lat_field, lat_hem);
+	let lon = coord_parse(lon_field, lon_hem);
+
+	if (lat == null || lon == null)
+		return;
+
+	gps_data.latitude = sprintf("%f", lat);
+	gps_data.longitude = sprintf("%f", lon);
+	stamp = clock(true)[0];
+
+	debug_msg(3, `position: ${gps_data.latitude} ${gps_data.longitude}`);
+}
+
+function time_parse(field) {
+	if (length(field) < 6)
+		return null;
+
+	return {
+		hour: +substr(field, 0, 2),
+		min: +substr(field, 2, 2),
+		sec: +substr(field, 4, 2)
+	};
+}
+
+/* DDMMYY, so the century is an assumption the NMEA sentence cannot settle */
+function date_parse(field) {
+	if (length(field) != 6)
+		return null;
+
+	return {
+		mday: +substr(field, 0, 2),
+		mon: +substr(field, 2, 2),
+		year: 2000 + +substr(field, 4, 2)
+	};
+}
+
+function clock_adjust(tm) {
+	let stamp_str = sprintf("%04d-%02d-%02d %02d:%02d:%02d",
+		tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec);
+
+	debug_msg(3, `date: ${gps_data.date}T${gps_data.time} UTC`);
+
+	if (!adjust_clock)
+		return;
+
+	let offset = timegm(tm) - time();
+
+	if (offset < 0)
+		offset = -offset;
+
+	if (offset <= MAX_TIME_OFFSET) {
+		bad_time = 0;
+		return;
+	}
+
+	if (++bad_time <= MAX_BAD_TIME)
+		return;
+
+	notice_msg(`system time differs from GPS time by more than ${MAX_TIME_OFFSET} seconds. Using ${stamp_str} UTC as the new time`);
+
+	/* ucode has no settimeofday binding */
+	if (system(`date -u -s '${stamp_str}' >/dev/null 2>&1`) != 0)
+		error_msg("failed to set the system time");
+}
+
+function datetime_set(date_field, time_field) {
+	let tm = time_parse(time_field);
+	let date = date_parse(date_field);
+
+	if (!tm)
+		return;
+
+	gps_data.time = sprintf("%02d:%02d:%02d", tm.hour, tm.min, tm.sec);
+
+	if (!date)
+		return;
+
+	gps_data.date = sprintf("%04d-%02d-%02d", date.year, date.mon, date.mday);
+
+	tm.mday = date.mday;
+	tm.mon = date.mon;
+	tm.year = date.year;
+
+	clock_adjust(tm);
+}
+
+/* Recommended minimum: position, speed over ground, date and time */
+function parse_rmc(talker, fields) {
+	if (length(fields) < 10)
+		return;
+
+	if (fields[2] != "A") {
+		valid = false;
+		debug_msg(4, "waiting for valid signal");
+		return;
+	}
+
+	valid = true;
+
+	datetime_set(fields[9], fields[1]);
+	position_set(fields[3], fields[4], fields[5], fields[6]);
+
+	if (length(fields[7]))
+		gps_data.speed_knots = fields[7];
+
+	/* VTG carries the same course, and wins because ugps reports that one */
+	if (length(fields[8]) && !length(gps_data.course ?? ""))
+		gps_data.course = fields[8];
+}
+
+/* Fix data: quality, satellites used, HDOP and altitude */
+function parse_gga(talker, fields) {
+	if (length(fields) < 10)
+		return;
+
+	if (!valid)
+		return;
+
+	if (length(fields[6]))
+		gps_data.fix_quality = +fields[6];
+
+	if (length(fields[7]))
+		gps_data.satellites = fields[7];
+
+	if (length(fields[8]))
+		gps_data.HDOP = fields[8];
+
+	if (length(fields[9]))
+		gps_data.elevation = fields[9];
+
+	position_set(fields[2], fields[3], fields[4], fields[5]);
+}
+
+/* Course over ground and ground speed */
+function parse_vtg(talker, fields) {
+	if (length(fields) < 9)
+		return;
+
+	if (!valid)
+		return;
+
+	if (length(fields[1]))
+		gps_data.course = fields[1];
+
+	if (length(fields[5]))
+		gps_data.speed_knots = fields[5];
+
+	/* ugps publishes the km/h field as "speed", so the unit has to stay */
+	if (length(fields[7]))
+		gps_data.speed = fields[7];
+}
+
+/* Geographic position */
+function parse_gll(talker, fields) {
+	if (length(fields) < 7)
+		return;
+
+	if (fields[6] != "A") {
+		valid = false;
+		debug_msg(4, "waiting for valid signal");
+		return;
+	}
+
+	valid = true;
+
+	position_set(fields[1], fields[2], fields[3], fields[4]);
+}
+
+/*
+ * Active satellites and dilution of precision. One sentence arrives per
+ * constellation, so the set is cleared when a new run of them starts rather
+ * than on a system id, which older receivers do not send at all.
+ */
+function parse_gsa(talker, fields) {
+	if (length(fields) < 18)
+		return;
+
+	if (!gsa_run) {
+		gsa_run = true;
+		gps_data.active_satellites = [];
+
+		for (let key in gnss)
+			gnss[key].active = 0;
+	}
+
+	if (length(fields[2]))
+		gps_data.fix_type = +fields[2];
+
+	for (let i = 3; i <= 14; i++) {
+		if (!length(fields[i]))
+			continue;
+
+		let prn = +fields[i];
+
+		if (index(gps_data.active_satellites, prn) >= 0)
+			continue;
+
+		push(gps_data.active_satellites, prn);
+		gnss[system_get(talker, prn)].active++;
+	}
+
+	if (length(fields[15]))
+		gps_data.PDOP = fields[15];
+	if (length(fields[16]))
+		gps_data.HDOP = fields[16];
+	if (length(fields[17]))
+		gps_data.VDOP = fields[17];
+}
+
+/*
+ * Satellites in view. Every constellation sends its own sequence, so the count
+ * is summed per talker instead of overwritten.
+ */
+function parse_gsv(talker, fields) {
+	if (length(fields) < 4)
+		return;
+
+	if (!gsv_run) {
+		gsv_run = true;
+		gps_data.satellites_view = [];
+		gsv_counts = {};
+
+		for (let key in gnss)
+			gnss[key].in_view = 0;
+	}
+
+	gsv_counts[talker] = +fields[3];
+
+	let total = 0;
+	for (let key in gsv_counts)
+		total += gsv_counts[key];
+
+	gps_data.satellites_in_view = total;
+
+	for (let base = 4; base + 3 < length(fields); base += 4) {
+		if (!length(fields[base]))
+			continue;
+
+		let prn = +fields[base];
+		let system = system_get(talker, prn);
+
+		push(gps_data.satellites_view, {
+			prn,
+			system,
+			elevation: length(fields[base + 1]) ? +fields[base + 1] : null,
+			azimuth: length(fields[base + 2]) ? +fields[base + 2] : null,
+			snr: length(fields[base + 3]) ? +fields[base + 3] : null
+		});
+
+		gnss[system].in_view++;
+	}
+}
+
+/* Date and time, used for the clock only */
+function parse_zda(talker, fields) {
+	if (length(fields) < 5)
+		return;
+
+	if (!valid)
+		return;
+
+	let tm = time_parse(fields[1]);
+
+	if (!tm || length(fields[2]) < 1 || length(fields[3]) < 1 || length(fields[4]) < 4)
+		return;
+
+	tm.mday = +fields[2];
+	tm.mon = +fields[3];
+	tm.year = +fields[4];
+
+	gps_data.time = sprintf("%02d:%02d:%02d", tm.hour, tm.min, tm.sec);
+	gps_data.date = sprintf("%04d-%02d-%02d", tm.year, tm.mon, tm.mday);
+
+	clock_adjust(tm);
+}
+
+/* Free text from the receiver */
+function parse_txt(talker, fields) {
+	if (length(fields) < 5)
+		return;
+
+	let severity = +fields[3];
+
+	if (severity < 0 || severity > 2)
+		severity = 0;
+
+	debug_msg(3, `${TXT_SEVERITY[severity]}: ${join(",", slice(fields, 4))}`);
+}
+
+function nmea_process(sentence) {
+	let payload = nmea_verify(sentence);
+
+	if (!payload) {
+		debug_msg(4, `invalid checksum: ${sentence}`);
+		return;
+	}
+
+	let fields = split(payload, ",");
+	let address = fields[0];
+
+	if (length(address) != 5)
+		return;
+
+	let talker = substr(address, 0, 2);
+	let type = substr(address, 2);
+
+	/* A run ends as soon as another sentence type arrives */
+	if (type != "GSA")
+		gsa_run = false;
+	if (type != "GSV")
+		gsv_run = false;
+
+	switch (type) {
+	case "RMC":
+		parse_rmc(talker, fields);
+		break;
+	case "GGA":
+		parse_gga(talker, fields);
+		break;
+	case "VTG":
+		parse_vtg(talker, fields);
+		break;
+	case "GLL":
+		parse_gll(talker, fields);
+		break;
+	case "GSA":
+		parse_gsa(talker, fields);
+		break;
+	case "GSV":
+		parse_gsv(talker, fields);
+		break;
+	case "ZDA":
+		parse_zda(talker, fields);
+		break;
+	case "TXT":
+		parse_txt(talker, fields);
+		break;
+	}
+}
+
+function reply_add(reply, key, value) {
+	if (value != null)
+		reply[key] = value;
+}
+
+/*
+ * ugps answers with a single "signal" field until it has a position, and from
+ * then on it reports every field it knows about. Both are kept here.
+ */
+function gps_info(req) {
+	/* ugps sends this as a blobmsg u8, which renders as false, so match it */
+	if (stamp == null)
+		return { signal: false };
+
+	let reply = {
+		age: clock(true)[0] - stamp
+	};
+
+	/* Fields below are published by ugps, so name, type and unit are fixed */
+	reply_add(reply, "latitude", gps_data.latitude);
+	reply_add(reply, "longitude", gps_data.longitude);
+	reply_add(reply, "elevation", gps_data.elevation);
+	reply_add(reply, "course", gps_data.course);
+	reply_add(reply, "speed", gps_data.speed);
+	reply_add(reply, "satellites", gps_data.satellites);
+	reply_add(reply, "HDOP", gps_data.HDOP);
+
+	reply_add(reply, "PDOP", gps_data.PDOP);
+	reply_add(reply, "VDOP", gps_data.VDOP);
+	reply_add(reply, "speed_knots", gps_data.speed_knots);
+	reply_add(reply, "date", gps_data.date);
+	reply_add(reply, "time", gps_data.time);
+	reply_add(reply, "fix_quality", gps_data.fix_quality);
+	reply_add(reply, "fix_type", gps_data.fix_type);
+	reply_add(reply, "fix_mode", FIX_MODE[gps_data.fix_type]);
+	reply_add(reply, "satellites_in_view", gps_data.satellites_in_view);
+	reply_add(reply, "active_satellites", gps_data.active_satellites);
+	reply_add(reply, "satellites_view", gps_data.satellites_view);
+	reply_add(reply, "valid", valid);
+	reply.gnss = gnss;
+
+	return reply;
+}
+
+function status_dump() {
+	if (debug_level < 3)
+		return;
+
+	debug_msg(3, sprintf("status: %J", gps_info(null)));
+}
+
+function on_receive(port) {
+	let line = trim(port.receive());
+
+	if (length(line))
+		nmea_process(line);
+}
+
+function on_error(port, reason) {
+	/* A single unusable line is not a reason to give up on the port */
+	if (reason == "overflow") {
+		debug_msg(1, "discarded an overlong line, check the baud rate");
+		return;
+	}
+
+	error_msg("tty error, shutting down");
+	exit(-1);
+}
+
+function usage(prog) {
+	warn(`Usage: ${prog} [options] <device>\n` +
+		"Options:\n" +
+		"	-a		Adjust system clock from gps\n" +
+		"	-s <path>	Path to ubus socket\n" +
+		"	-d <level>	Enable debug messages\n" +
+		"	-S		Print messages to stdout\n" +
+		"	-b		Set gps device baud rate\n" +
+		"\n");
+
+	exit(1);
+}
+
+let device;
+let baud = 4800;
+let ubus_socket;
+let ulog_channel = log.ULOG_KMSG;
+
+let dbglvl = getenv("DBGLVL");
+if (dbglvl)
+	debug_level = +dbglvl;
+
+for (let i = 0; i < length(ARGV); i++) {
+	let arg = ARGV[i];
+
+	switch (arg) {
+	case "-a":
+		adjust_clock = true;
+		break;
+	case "-s":
+		ubus_socket = ARGV[++i];
+		break;
+	case "-d":
+		debug_level = +ARGV[++i];
+		break;
+	case "-S":
+		ulog_channel = log.ULOG_STDIO;
+		break;
+	case "-b":
+		baud = +ARGV[++i];
+		break;
+	default:
+		if (substr(arg, 0, 1) == "-")
+			usage("ucode-gps");
+		device = arg;
+	}
+}
+
+if (!device) {
+	warn("ERROR: missing device parameter\n");
+	usage("ucode-gps");
+}
+
+log.ulog_open(ulog_channel, log.LOG_DAEMON, "ugps");
+
+gnss_reset();
+
+uloop.init();
+
+let ubus_conn;
+let gps_object;
+let ubus_connect;
+
+ubus_connect = function() {
+	ubus_conn = ubus_socket ? ubus.connect(ubus_socket) : ubus.connect();
+
+	if (ubus_conn)
+		gps_object = ubus_conn.publish("gps", { info: { call: gps_info } });
+
+	if (gps_object) {
+		debug_msg(1, "connected to ubus");
+		return;
+	}
+
+	/* ubusd may still be starting up, so keep trying like ubus_auto_connect */
+	debug_msg(1, `waiting for ubus: ${ubus.error() ?? "publish failed"}`);
+	uloop.timer(1000, ubus_connect);
+};
+
+ubus_connect();
+
+try {
+	tty.open({
+		path: device,
+		baud,
+		bits: 8,
+		parity: false,
+		stopbits: 1,
+		linebased: true,
+		on_receive,
+		on_error
+	});
+} catch (e) {
+	error_msg(`${device}: device open failed: ${e}`);
+	exit(-1);
+}
+
+debug_msg(1, `reading ${device} at ${baud} baud`);
+
+uloop.interval(5000, status_dump);
+
+uloop.run();
+uloop.done();

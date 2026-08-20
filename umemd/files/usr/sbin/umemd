@@ -1,0 +1,357 @@
+#!/usr/bin/ucode
+
+/*
+ * SPDX-License-Identifier: GPL-2.0-only
+ *
+ * Copyright (C) 2026 John Crispin <john@phrozen.org>
+ */
+
+'use strict';
+
+import * as ubus from 'ubus';
+import * as uloop from 'uloop';
+import { readfile, opendir, basename } from 'fs';
+
+const SCAN_MS = 60 * 1000;
+const WINDOW_MS = 10 * 60 * 1000;
+const HISTORY_WINDOWS = 12;
+
+const LEAK_MIN_KB = 32;
+const LEAK_MIN_KB_H = 64;
+const LEAK_MIN_FDS = 4;
+
+const INTERPRETERS = [ 'ucode', 'env', 'sh', 'ash', 'bash', 'lua', 'perl', 'python3' ];
+const ANCESTRY_MAX = 8;
+
+let procs = {};
+let procd = {};
+
+function meminfo_read() {
+	let content = readfile('/proc/meminfo');
+	if (!content)
+		return {};
+	let info = {};
+	for (let line in split(content, '\n')) {
+		let m = match(line, /^([A-Za-z()]+):[ \t]+([0-9]+)/);
+		if (m)
+			info[m[1]] = int(m[2]);
+	}
+	return info;
+}
+
+function proc_status_read(pid) {
+	let content = readfile(`/proc/${pid}/status`);
+	if (!content)
+		return null;
+	let rss = match(content, /VmRSS:[ \t]+([0-9]+)/);
+	if (!rss)
+		return null;
+	let ppid = match(content, /PPid:[ \t]+([0-9]+)/);
+	let comm = match(content, /Name:[ \t]+([^\n]+)/);
+	return {
+		comm: comm ? comm[1] : '',
+		rss: int(rss[1]),
+		ppid: ppid ? ppid[1] : null,
+	};
+}
+
+function proc_fds_count(pid) {
+	let dir = opendir(`/proc/${pid}/fd`);
+	if (!dir)
+		return 0;
+	let n = 0;
+	while (dir.read() != null)
+		n++;
+	dir.close();
+	return n;
+}
+
+function proc_argv_read(pid) {
+	let content = readfile(`/proc/${pid}/cmdline`);
+	if (content == null)
+		return [];
+	return filter(split(content, "\0"), arg => arg != '');
+}
+
+function proc_sample(pid) {
+	let st = proc_status_read(pid);
+	if (!st)
+		return null;
+	return { comm: st.comm, rss: st.rss, ppid: st.ppid, fds: proc_fds_count(pid), ts: time() };
+}
+
+function procd_map_refresh() {
+	let list = ubus.call({ object: 'service', method: 'list' });
+	if (!list)
+		return;
+
+	let map = {};
+	for (let service, def in list) {
+		if (!def?.instances)
+			continue;
+		for (let instance, inst in def.instances) {
+			if (!inst?.pid)
+				continue;
+			let cmd = inst.command?.[0];
+			map[sprintf('%d', inst.pid)] = {
+				service,
+				instance,
+				name: cmd ? basename(cmd) : null,
+			};
+		}
+	}
+
+	procd = map;
+}
+
+function jail_name(argv) {
+	let sep = index(argv, '--');
+	if (sep >= 0 && sep + 1 < length(argv))
+		return basename(argv[sep + 1]);
+
+	let named = index(argv, '-n');
+	if (named >= 0 && named + 1 < length(argv))
+		return argv[named + 1];
+
+	return 'ujail';
+}
+
+function argv_name(argv) {
+	if (!length(argv))
+		return null;
+
+	if (basename(argv[0]) == 'ujail')
+		return jail_name(argv);
+
+	let name = basename(argv[0]);
+
+	for (let i = 1; i < length(argv); i++) {
+		if (index(INTERPRETERS, name) < 0)
+			break;
+		if (substr(argv[i], 0, 1) == '-')
+			break;
+		name = basename(argv[i]);
+	}
+
+	return name;
+}
+
+function service_find(pid) {
+	let cur = pid;
+
+	for (let hop = 0; hop < ANCESTRY_MAX; hop++) {
+		if (!cur || cur == '1')
+			return null;
+		if (procd[cur])
+			return procd[cur];
+		cur = procs[cur]?.ppid;
+	}
+
+	return null;
+}
+
+function names_resolve() {
+	for (let pid, p in procs) {
+		let svc = service_find(pid);
+
+		p.name = procd[pid]?.name ?? p.argv_name ?? p.cmd;
+		p.service = svc?.service;
+		p.instance = svc?.instance;
+	}
+}
+
+function proc_track(pid, s) {
+	let argv = proc_argv_read(pid);
+	let usage = { rss: s.rss, fds: s.fds, ts: s.ts };
+
+	procs[pid] = {
+		comm: s.comm,
+		cmd: argv[0] ?? '',
+		argv_name: argv_name(argv),
+		ppid: s.ppid,
+		first: usage,
+		current: { ...usage },
+		peak_rss: s.rss,
+		win_rss: s.rss,
+		win_fds: s.fds,
+		floor_rss: [],
+		floor_fds: [],
+	};
+}
+
+function proc_update(p, s) {
+	p.current = { rss: s.rss, fds: s.fds, ts: s.ts };
+	p.ppid = s.ppid;
+
+	if (s.rss > p.peak_rss)
+		p.peak_rss = s.rss;
+	if (s.rss < p.win_rss)
+		p.win_rss = s.rss;
+	if (s.fds < p.win_fds)
+		p.win_fds = s.fds;
+}
+
+function scan() {
+	let dir = opendir('/proc');
+	if (!dir)
+		return;
+
+	procd_map_refresh();
+
+	let seen = {};
+	let entry;
+	while ((entry = dir.read()) != null) {
+		if (!match(entry, /^[0-9]+$/))
+			continue;
+
+		let pid = entry;
+		let s = proc_sample(pid);
+		if (!s)
+			continue;
+
+		let p = procs[pid];
+
+		if (p && p.comm == s.comm)
+			proc_update(p, s);
+		else
+			proc_track(pid, s);
+
+		seen[pid] = true;
+	}
+	dir.close();
+
+	let dead = [];
+	for (let pid in procs)
+		if (!seen[pid])
+			push(dead, pid);
+	for (let pid in dead)
+		delete procs[pid];
+
+	names_resolve();
+}
+
+function ring_push(ring, value) {
+	push(ring, value);
+	if (length(ring) > HISTORY_WINDOWS)
+		shift(ring);
+}
+
+function windows_roll() {
+	for (let pid, p in procs) {
+		ring_push(p.floor_rss, p.win_rss);
+		ring_push(p.floor_fds, p.win_fds);
+
+		p.win_rss = p.current.rss;
+		p.win_fds = p.current.fds;
+	}
+}
+
+function floor_trend(ring) {
+	let n = length(ring);
+	if (n < HISTORY_WINDOWS)
+		return null;
+
+	let growth = ring[n - 1] - ring[0];
+
+	return {
+		windows: n,
+		growth,
+		rate: growth * 3600000 / ((n - 1) * WINDOW_MS),
+	};
+}
+
+function proc_state(rt, ft) {
+	if (!rt)
+		return 'warmup';
+
+	if (rt.growth >= LEAK_MIN_KB && rt.rate >= LEAK_MIN_KB_H)
+		return 'leaking';
+
+	if (ft.growth >= LEAK_MIN_FDS)
+		return 'leaking';
+
+	return 'stable';
+}
+
+function memory_info(req) {
+	let mi = meminfo_read();
+	let leaking = [];
+	let stable = [];
+	let warmup = [];
+	let buckets = { leaking, stable, warmup };
+
+	for (let pid, p in procs) {
+		let rt = floor_trend(p.floor_rss);
+		let ft = floor_trend(p.floor_fds);
+		let entry = {
+			pid: int(pid),
+			name: p.name,
+			cmd: p.cmd,
+			state: proc_state(rt, ft),
+			age_s: p.current.ts - p.first.ts,
+			windows: length(p.floor_rss),
+			rss_kb: p.current.rss,
+			rss_first_kb: p.first.rss,
+			rss_peak_kb: p.peak_rss,
+			rss_delta_kb: p.current.rss - p.first.rss,
+			fds: p.current.fds,
+			fds_first: p.first.fds,
+			fds_delta: p.current.fds - p.first.fds,
+		};
+
+		if (p.service) {
+			entry.service = p.service;
+			entry.instance = p.instance;
+		}
+		if (rt) {
+			entry.rss_growth_kb = rt.growth;
+			entry.rss_rate_kb_h = rt.rate;
+		}
+		if (ft)
+			entry.fds_growth = ft.growth;
+
+		push(buckets[entry.state], entry);
+	}
+
+	sort(leaking, (a, b) => b.rss_growth_kb - a.rss_growth_kb);
+	sort(stable, (a, b) => b.rss_kb - a.rss_kb);
+	sort(warmup, (a, b) => b.rss_kb - a.rss_kb);
+
+	return {
+		system: {
+			total_kb: mi.MemTotal ?? 0,
+			free_kb: mi.MemFree ?? 0,
+			available_kb: mi.MemAvailable ?? 0,
+			buff_cache_kb: (mi.Buffers ?? 0) + (mi.Cached ?? 0),
+			swap_total_kb: mi.SwapTotal ?? 0,
+			swap_free_kb: mi.SwapFree ?? 0,
+		},
+		detector: {
+			sample_ms: SCAN_MS,
+			window_ms: WINDOW_MS,
+			history_windows: HISTORY_WINDOWS,
+			leak_min_kb: LEAK_MIN_KB,
+			leak_min_kb_h: LEAK_MIN_KB_H,
+			leak_min_fds: LEAK_MIN_FDS,
+		},
+		leaking,
+		stable,
+		warmup,
+	};
+}
+
+uloop.init();
+
+scan();
+uloop.interval(SCAN_MS, scan);
+uloop.interval(WINDOW_MS, windows_roll);
+
+ubus.publish("memory", {
+	info: {
+		call: memory_info,
+		args: {},
+	},
+});
+
+uloop.run();
+uloop.done();

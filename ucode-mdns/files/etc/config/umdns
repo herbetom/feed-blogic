@@ -1,0 +1,23 @@
+config umdns
+	# UCI networks to answer on. Each one is resolved to its l3_device
+	# through netifd, so a bridge or a tunnel needs no extra entry.
+	list network lan
+
+	# raw device names, for a device netifd does not manage
+	# list device br-guest
+
+	# host name to claim, without the .local suffix. Unset takes the
+	# system host name.
+	# option hostname 'router'
+
+	# address families to serve
+	option ipv4 '1'
+	option ipv6 '1'
+
+	# debug prints the protocol decisions, trace adds every packet
+	option debug '0'
+	option trace '0'
+
+	# run under the procd jail, alongside the seccomp profile that is
+	# always applied
+	option jail '1'

@@ -1,0 +1,287 @@
+#!/usr/bin/env ucode
+
+/*
+ * SPDX-License-Identifier: GPL-2.0-only
+ *
+ * Copyright (C) 2026 John Crispin <john@phrozen.org>
+ */
+
+'use strict';
+
+import * as unetmsg from 'unetmsg.client';
+import * as libubus from 'ubus';
+import * as uloop from 'uloop';
+
+let chan;
+let active = {};
+
+uloop.init();
+let ubus = libubus.connect();
+
+function procd_data() {
+	const wireless_status = ubus.call('network.wireless', 'status');
+	if (!wireless_status)
+		return libubus.STATUS_NOT_SUPPORTED;
+
+	let data = {};
+	for (let radio, v in wireless_status) {
+		if (!v.up)
+			continue;
+		for (let network, config in active) {
+			for (let band in config.bands) {
+				if (!(band == v.config.band || band in v.config.band))
+					continue;
+				data[radio] ??= {};
+				data[radio][config.config.ssid] = {
+					device: radio,
+					config: config.config,
+				}
+			}
+		}
+	}
+	ubus.call('service', 'set', {
+		name: 'wifi-dynamic',
+		data: { 'wifi-iface': data }
+	});
+
+	ubus.call('network', 'reload');
+
+	return libubus.STATUS_OK;
+}
+
+let procd_timer;
+function procd_data_schedule() {
+	if (procd_timer)
+		return procd_timer.set(200);
+
+	procd_timer = uloop.timer(200, () => {
+		procd_timer = null;
+		procd_data();
+	});
+}
+
+function networks_owned() {
+	let owned = {};
+
+	for (let name, entry in active) {
+		if (entry.origin)
+			continue;
+
+		owned[name] = {
+			bands: entry.bands,
+			ssid: entry.config.ssid,
+			encryption: entry.config.encryption,
+			key: entry.config.key,
+		};
+	}
+
+	return owned;
+}
+
+function networks_send() {
+	if (chan)
+		chan.send('wifi-dyn', 'networks', { networks: networks_owned() });
+}
+
+function networks_recv(host, networks) {
+	if (!host)
+		return;
+
+	for (let name in keys(active))
+		if (active[name].origin == host)
+			delete active[name];
+
+	for (let name, config in networks ?? {}) {
+		if (active[name])
+			continue;
+
+		active[name] = {
+			origin: host,
+			bands: config.bands,
+			config: {
+				mode: 'ap',
+				ssid: config.ssid,
+				network: [ name ],
+				encryption: config.encryption,
+				key: config.key,
+			},
+		};
+	}
+
+	procd_data_schedule();
+}
+
+function networks_request() {
+	if (!chan)
+		return;
+
+	chan.request('wifi-dyn', 'networks', {}, (msg) => {
+		networks_recv(msg.host, msg.networks);
+	}, () => {});
+}
+
+function timer_expired_cb() {
+	let expired = [];
+
+	for (let name, network in active) {
+		if (!network.timer)
+			continue;
+		if (network.timer.remaining() > 0)
+			continue;
+		push(expired, name);
+	}
+
+	if (!length(expired))
+		return;
+
+	for (let name in expired)
+		delete active[name];
+
+	procd_data();
+	networks_send();
+}
+
+chan = unetmsg.open(ubus);
+
+chan.subscribe('wifi-dyn', (req) => {
+		networks_recv(req.args.host, req.args.data.networks);
+	}, () => {
+		for (let name in keys(active))
+			if (active[name].origin)
+				delete active[name];
+
+		procd_data_schedule();
+		networks_request();
+		networks_send();
+	});
+
+chan.publish('wifi-dyn', (req) => {
+	if (req.args.type == 'networks')
+		return { networks: networks_owned() };
+
+	return 0;
+});
+
+let ubus_methods = {
+	add: {
+		call: function(req) {
+			if (active[req.args.network] && !active[req.args.network].origin)
+				return libubus.STATUS_PERMISSION_DENIED;
+
+			for (let k in [ 'network', 'ssid', 'key', 'encryption', 'bands' ])
+				if (!req.args[k])
+					return libubus.STATUS_INVALID_ARGUMENT;
+
+			const key_length = length(req.args.key);
+			if (key_length < 8 || key_length > 63)
+				return libubus.STATUS_INVALID_ARGUMENT;
+
+			const ssid_length = length(req.args.ssid);
+			if (ssid_length < 1 || ssid_length > 32)
+				return libubus.STATUS_INVALID_ARGUMENT;
+
+			const network_status = ubus.call('network.interface.' + req.args.network, 'status');
+			if (!network_status)
+				return libubus.STATUS_INVALID_ARGUMENT;
+	
+	       		active[req.args.network] = {
+				bands: req.args.bands,
+				config : {
+					mode: 'ap',
+					ssid: req.args.ssid,
+					network: [ req.args.network ],
+					encryption: req.args.encryption,
+					key: req.args.key,
+				},
+			};
+
+			if (req.args.timeout)
+				active[req.args.network].timer = uloop.timer(req.args.timeout * 1000, timer_expired_cb);
+
+			let status = procd_data();
+			networks_send();
+			return status;
+		},
+		args: {
+			bands: [ '2g', '5g' ],
+			network: 'lan',
+			ssid: 'wifi-dynamic',
+			key: '00000000',
+			encryption: 'sae',
+			timeout: 60
+		}
+	},
+
+	remove: {
+		call: function(req) {
+			if (!active[req.args.network])
+				return libubus.STATUS_NOT_FOUND;
+			if (active[req.args.network].origin)
+				return libubus.STATUS_NOT_SUPPORTED;
+
+			delete active[req.args.network];
+
+			let status = procd_data();
+			networks_send();
+			return status;
+		},
+		args: {
+			network: 'guest',
+		},
+	},
+
+	update: {
+		call: function(req) {
+			if (!active[req.args.network])
+				return libubus.STATUS_NOT_FOUND;
+			if (active[req.args.network].origin)
+				return libubus.STATUS_NOT_SUPPORTED;
+
+			if (!req.args.timeout || !active[req.args.network].timer)
+				return libubus.STATUS_INVALID_ARGUMENT;
+
+			active[req.args.network].timer.set(req.args.timeout * 1000);
+
+			return libubus.STATUS_OK;
+		},
+		args: {
+			network: 'guest',
+			timeout: 60,
+		},
+	},
+
+	status: {
+		call: function(req) {
+			let ret = {
+				network: req.args.network,
+				active: false,
+			};
+			
+			let network = active[req.args.network];
+			if (network) {
+				ret.active = true;
+				ret.origin = network.origin ?? 'local';
+				ret.ssid = network.config.ssid;
+				ret.key = network.config.key;
+				ret.encryption = network.config.encryption;
+				if (network.timer)
+					ret.remaining = network.timer.remaining() / 1000;
+			}
+
+			return ret;
+		},
+		args: {
+			network: 'guest',
+		},
+	},
+
+	dump: {
+		call: function(req) {
+			return active;
+		},
+		args: {},
+	}
+};
+ubus.publish('wifi-dyn', ubus_methods);
+
+uloop.run();
