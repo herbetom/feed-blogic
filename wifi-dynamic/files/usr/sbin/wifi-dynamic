@@ -11,9 +11,14 @@
 import * as unetmsg from 'unetmsg.client';
 import * as libubus from 'ubus';
 import * as uloop from 'uloop';
+import * as libuci from 'uci';
+
+const DEFAULT_TIMEOUT = 3600;
+const DEFAULT_BANDS = [ '2g', '5g' ];
 
 let chan;
 let active = {};
+let profiles = {};
 
 uloop.init();
 let ubus = libubus.connect();
@@ -141,6 +146,134 @@ function timer_expired_cb() {
 	networks_send();
 }
 
+/* A single 'list bands' entry can arrive as a bare string. */
+function bands_normalise(bands) {
+	if (!bands)
+		return DEFAULT_BANDS;
+
+	return type(bands) == 'array' ? bands : [ bands ];
+}
+
+function profiles_load() {
+	let cursor = libuci.cursor();
+
+	profiles = {};
+
+	if (!cursor.load('wireless'))
+		return warn("wifi-dynamic: cannot load /etc/config/wireless\n");
+
+	cursor.foreach('wireless', 'wifi-dynamic', (s) => {
+		const name = s['.name'];
+
+		if (!s.ssid || !s.key || !s.network)
+			return warn(`wifi-dynamic: ${name} needs ssid, key and network\n`);
+
+		const key_length = length(s.key);
+		if (key_length < 8 || key_length > 63)
+			return warn(`wifi-dynamic: ${name} key is ${key_length} characters\n`);
+
+		const ssid_length = length(s.ssid);
+		if (ssid_length < 1 || ssid_length > 32)
+			return warn(`wifi-dynamic: ${name} ssid is ${ssid_length} characters\n`);
+
+		profiles[name] = {
+			name,
+			ssid: s.ssid,
+			key: s.key,
+			network: s.network,
+			encryption: s.encryption ?? 'sae',
+			bands: bands_normalise(s.bands),
+			timeout: +(s.timeout ?? DEFAULT_TIMEOUT),
+		};
+	});
+}
+
+function network_start(cfg, timeout, profile) {
+	if (active[cfg.network] && !active[cfg.network].origin)
+		return libubus.STATUS_PERMISSION_DENIED;
+
+	for (let k in [ 'network', 'ssid', 'key', 'encryption', 'bands' ])
+		if (!cfg[k])
+			return libubus.STATUS_INVALID_ARGUMENT;
+
+	const key_length = length(cfg.key);
+	if (key_length < 8 || key_length > 63)
+		return libubus.STATUS_INVALID_ARGUMENT;
+
+	const ssid_length = length(cfg.ssid);
+	if (ssid_length < 1 || ssid_length > 32)
+		return libubus.STATUS_INVALID_ARGUMENT;
+
+	if (!ubus.call('network.interface.' + cfg.network, 'status'))
+		return libubus.STATUS_INVALID_ARGUMENT;
+
+	active[cfg.network] = {
+		bands: cfg.bands,
+		profile,
+		config: {
+			mode: 'ap',
+			ssid: cfg.ssid,
+			network: [ cfg.network ],
+			encryption: cfg.encryption,
+			key: cfg.key,
+		},
+	};
+
+	if (timeout)
+		active[cfg.network].timer = uloop.timer(timeout * 1000, timer_expired_cb);
+
+	let status = procd_data();
+	networks_send();
+
+	return status;
+}
+
+function network_stop(network) {
+	if (!active[network])
+		return libubus.STATUS_NOT_FOUND;
+	if (active[network].origin)
+		return libubus.STATUS_NOT_SUPPORTED;
+
+	delete active[network];
+
+	let status = procd_data();
+	networks_send();
+
+	return status;
+}
+
+function network_extend(network, timeout) {
+	if (!active[network])
+		return libubus.STATUS_NOT_FOUND;
+	if (active[network].origin)
+		return libubus.STATUS_NOT_SUPPORTED;
+	if (!timeout || !active[network].timer)
+		return libubus.STATUS_INVALID_ARGUMENT;
+
+	active[network].timer.set(timeout * 1000);
+
+	return libubus.STATUS_OK;
+}
+
+function profile_state(p) {
+	let entry = active[p.network];
+	let running = entry && !entry.origin && entry.profile == p.name;
+
+	return {
+		name: p.name,
+		ssid: p.ssid,
+		key: p.key,
+		encryption: p.encryption,
+		bands: join('/', p.bands),
+		network: p.network,
+		timeout: p.timeout,
+		active: !!running,
+		remaining: running && entry.timer ? entry.timer.remaining() / 1000 : 0,
+	};
+}
+
+profiles_load();
+
 chan = unetmsg.open(ubus);
 
 chan.subscribe('wifi-dyn', (req) => {
@@ -165,42 +298,13 @@ chan.publish('wifi-dyn', (req) => {
 let ubus_methods = {
 	add: {
 		call: function(req) {
-			if (active[req.args.network] && !active[req.args.network].origin)
-				return libubus.STATUS_PERMISSION_DENIED;
-
-			for (let k in [ 'network', 'ssid', 'key', 'encryption', 'bands' ])
-				if (!req.args[k])
-					return libubus.STATUS_INVALID_ARGUMENT;
-
-			const key_length = length(req.args.key);
-			if (key_length < 8 || key_length > 63)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			const ssid_length = length(req.args.ssid);
-			if (ssid_length < 1 || ssid_length > 32)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			const network_status = ubus.call('network.interface.' + req.args.network, 'status');
-			if (!network_status)
-				return libubus.STATUS_INVALID_ARGUMENT;
-	
-	       		active[req.args.network] = {
+			return network_start({
+				network: req.args.network,
+				ssid: req.args.ssid,
+				key: req.args.key,
+				encryption: req.args.encryption,
 				bands: req.args.bands,
-				config : {
-					mode: 'ap',
-					ssid: req.args.ssid,
-					network: [ req.args.network ],
-					encryption: req.args.encryption,
-					key: req.args.key,
-				},
-			};
-
-			if (req.args.timeout)
-				active[req.args.network].timer = uloop.timer(req.args.timeout * 1000, timer_expired_cb);
-
-			let status = procd_data();
-			networks_send();
-			return status;
+			}, req.args.timeout, null);
 		},
 		args: {
 			bands: [ '2g', '5g' ],
@@ -214,16 +318,7 @@ let ubus_methods = {
 
 	remove: {
 		call: function(req) {
-			if (!active[req.args.network])
-				return libubus.STATUS_NOT_FOUND;
-			if (active[req.args.network].origin)
-				return libubus.STATUS_NOT_SUPPORTED;
-
-			delete active[req.args.network];
-
-			let status = procd_data();
-			networks_send();
-			return status;
+			return network_stop(req.args.network);
 		},
 		args: {
 			network: 'guest',
@@ -232,17 +327,7 @@ let ubus_methods = {
 
 	update: {
 		call: function(req) {
-			if (!active[req.args.network])
-				return libubus.STATUS_NOT_FOUND;
-			if (active[req.args.network].origin)
-				return libubus.STATUS_NOT_SUPPORTED;
-
-			if (!req.args.timeout || !active[req.args.network].timer)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			active[req.args.network].timer.set(req.args.timeout * 1000);
-
-			return libubus.STATUS_OK;
+			return network_extend(req.args.network, req.args.timeout);
 		},
 		args: {
 			network: 'guest',
@@ -256,7 +341,7 @@ let ubus_methods = {
 				network: req.args.network,
 				active: false,
 			};
-			
+
 			let network = active[req.args.network];
 			if (network) {
 				ret.active = true;
@@ -264,6 +349,8 @@ let ubus_methods = {
 				ret.ssid = network.config.ssid;
 				ret.key = network.config.key;
 				ret.encryption = network.config.encryption;
+				if (network.profile)
+					ret.profile = network.profile;
 				if (network.timer)
 					ret.remaining = network.timer.remaining() / 1000;
 			}
@@ -278,6 +365,74 @@ let ubus_methods = {
 	dump: {
 		call: function(req) {
 			return active;
+		},
+		args: {},
+	},
+
+	list: {
+		call: function(req) {
+			let out = [];
+
+			for (let name, p in profiles)
+				push(out, profile_state(p));
+
+			return { profiles: out };
+		},
+		args: {},
+	},
+
+	enable: {
+		call: function(req) {
+			let p = profiles[req.args.name];
+			if (!p)
+				return libubus.STATUS_NOT_FOUND;
+
+			return network_start({
+				network: p.network,
+				ssid: p.ssid,
+				key: p.key,
+				encryption: p.encryption,
+				bands: p.bands,
+			}, req.args.timeout ?? p.timeout, p.name);
+		},
+		args: {
+			name: 'guest',
+			timeout: 60,
+		},
+	},
+
+	disable: {
+		call: function(req) {
+			let p = profiles[req.args.name];
+			if (!p)
+				return libubus.STATUS_NOT_FOUND;
+
+			return network_stop(p.network);
+		},
+		args: {
+			name: 'guest',
+		},
+	},
+
+	extend: {
+		call: function(req) {
+			let p = profiles[req.args.name];
+			if (!p)
+				return libubus.STATUS_NOT_FOUND;
+
+			return network_extend(p.network, req.args.timeout ?? p.timeout);
+		},
+		args: {
+			name: 'guest',
+			timeout: 60,
+		},
+	},
+
+	reload: {
+		call: function(req) {
+			profiles_load();
+
+			return libubus.STATUS_OK;
 		},
 		args: {},
 	}

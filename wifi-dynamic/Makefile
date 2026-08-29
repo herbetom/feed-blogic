@@ -12,7 +12,7 @@ define Package/wifi-dynamic
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Configure dynamic wifi instances
-  DEPENDS:=+unetmsg
+  DEPENDS:=+unetmsg +ucode-mod-uci
 endef
 
 define Package/wifi-dynamic/description
