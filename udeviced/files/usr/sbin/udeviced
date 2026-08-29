@@ -1,0 +1,126 @@
+#!/usr/bin/env ucode
+
+/*
+ * SPDX-License-Identifier: GPL-2.0-only
+ *
+ * Copyright (C) 2026 John Crispin <john@phrozen.org>
+ */
+
+'use strict';
+
+import * as uloop from 'uloop';
+import * as libubus from 'ubus';
+import { config, config_load } from 'udevice.config';
+import { traffic_init, traffic_resolve, traffic_sample, traffic_status,
+	 traffic_history } from 'udevice.traffic';
+import { system_init, system_sample, system_status,
+	 system_history } from 'udevice.system';
+
+const SAMPLE_MS = 1000;
+
+const WINDOWS = [ 'live', 'hour', 'day', 'month' ];
+const SERIES = [ 'rx', 'tx', 'cpu', 'mem', 'temp', 'load' ];
+
+let clock = { ms: 0, uptime: 0 };
+
+uloop.init();
+
+let ubus = libubus.connect();
+
+function reload() {
+	config_load();
+	traffic_init(ubus, config.interfaces);
+	system_init(config.thermal);
+}
+
+function tick() {
+	const now = time();
+
+	traffic_sample(now);
+	system_sample(now);
+
+	clock.ms += SAMPLE_MS;
+	clock.uptime = clock.ms / 1000;
+}
+
+function ubus_status(req) {
+	let out = { ms: clock.ms, uptime: clock.uptime, ...system_status() };
+
+	out.interfaces = traffic_status();
+
+	return out;
+}
+
+function ubus_history(req) {
+	const window = req.args?.window ?? 'live';
+
+	if (index(WINDOWS, window) < 0)
+		return libubus.STATUS_INVALID_ARGUMENT;
+
+	const history = traffic_history(req.args?.interface, window);
+
+	if (!history)
+		return libubus.STATUS_NOT_FOUND;
+
+	let out = {
+		window,
+		interface: history.interface,
+		step: history.step,
+		count: history.count,
+		start: history.start,
+		rx: history.rx,
+		tx: history.tx,
+	};
+
+	for (let name, entries in system_history(window))
+		out[name] = entries;
+
+	const wanted = req.args?.series;
+
+	if (wanted)
+		for (let name in SERIES)
+			if (index(wanted, name) < 0)
+				delete out[name];
+
+	return out;
+}
+
+function ubus_reload(req) {
+	reload();
+
+	return libubus.STATUS_OK;
+}
+
+let ubus_methods = {
+	status: {
+		call: ubus_status,
+		args: {},
+	},
+
+	history: {
+		call: ubus_history,
+		args: {
+			window: 'live',
+			interface: 'wan',
+			series: [],
+		},
+	},
+
+	reload: {
+		call: ubus_reload,
+		args: {},
+	},
+};
+
+reload();
+
+ubus.listener('network.interface', (event, msg) => {
+	traffic_resolve();
+});
+
+ubus.publish('device', ubus_methods);
+
+uloop.interval(SAMPLE_MS, tick);
+
+uloop.run();
+uloop.done();

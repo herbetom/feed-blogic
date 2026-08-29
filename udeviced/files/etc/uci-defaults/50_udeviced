@@ -1,0 +1,15 @@
+#!/bin/sh
+
+[ -n "$(uci -q get system.@monitoring[0])" ] && exit 0
+
+uci -q add system monitoring > /dev/null
+uci -q add_list system.@monitoring[-1].interface='wan'
+
+for input in /sys/class/hwmon/hwmon*/temp1_input; do
+	[ -f "$input" ] || continue
+	uci -q add_list system.@monitoring[-1].thermal="$input"
+done
+
+uci commit system
+
+exit 0
