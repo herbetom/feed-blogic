@@ -1,0 +1,125 @@
+#!/usr/bin/env ucode
+
+/*
+ * SPDX-License-Identifier: GPL-2.0-only
+ *
+ * Copyright (C) 2026 John Crispin <john@phrozen.org>
+ */
+
+'use strict';
+
+import * as uloop from 'uloop';
+import * as libubus from 'ubus';
+import { config, config_load } from 'uclient.config';
+import { clients_init, clients_refresh_bss, clients_poll, clients_identity,
+	 clients_sync, clients_list, clients_get,
+	 clients_forget } from 'uclient.clients';
+
+const BSS_MS = 60 * 1000;
+const SHOT_MS = 10 * 1000;
+
+let poll_timer, identity_timer, shot_timer;
+
+uloop.init();
+
+let ubus = libubus.connect();
+
+function shot_fire() {
+	const now = time();
+
+	shot_timer = null;
+
+	clients_identity(now);
+	clients_sync(now);
+}
+
+function poll() {
+	const now = time();
+
+	if (clients_poll(now) && !shot_timer)
+		shot_timer = uloop.timer(SHOT_MS, shot_fire);
+
+	clients_sync(now);
+}
+
+function identity() {
+	const now = time();
+
+	clients_identity(now);
+	clients_sync(now);
+}
+
+function reload() {
+	const now = time();
+
+	config_load();
+	clients_init(ubus, now);
+	clients_poll(now);
+	clients_identity(now);
+
+	if (poll_timer)
+		poll_timer.set(config.poll * 1000);
+
+	if (identity_timer)
+		identity_timer.set(config.identity * 1000);
+}
+
+function ubus_list(req) {
+	const list = clients_list();
+
+	return { count: length(list), clients: list };
+}
+
+function ubus_get(req) {
+	const record = clients_get(req.args?.mac);
+
+	return record ?? libubus.STATUS_NOT_FOUND;
+}
+
+function ubus_forget(req) {
+	if (!req.args?.mac)
+		return libubus.STATUS_INVALID_ARGUMENT;
+
+	return clients_forget(req.args.mac) ? libubus.STATUS_OK
+					   : libubus.STATUS_NOT_FOUND;
+}
+
+function ubus_reload(req) {
+	reload();
+
+	return libubus.STATUS_OK;
+}
+
+let ubus_methods = {
+	list: {
+		call: ubus_list,
+		args: {},
+	},
+
+	get: {
+		call: ubus_get,
+		args: { mac: '' },
+	},
+
+	forget: {
+		call: ubus_forget,
+		args: { mac: '' },
+	},
+
+	reload: {
+		call: ubus_reload,
+		args: {},
+	},
+};
+
+reload();
+
+ubus.publish('clients', ubus_methods);
+
+poll_timer = uloop.interval(config.poll * 1000, poll);
+identity_timer = uloop.interval(config.identity * 1000, identity);
+
+uloop.interval(BSS_MS, clients_refresh_bss);
+
+uloop.run();
+uloop.done();

@@ -1,0 +1,7 @@
+config clients 'main'
+	option store '/etc/clients'
+	option settle '600'
+	option margin '2'
+	option poll '5'
+	option identity '60'
+	option max_clients '512'

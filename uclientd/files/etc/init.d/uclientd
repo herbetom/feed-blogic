@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+
+START=81
+STOP=01
+
+USE_PROCD=1
+
+PROG=/usr/sbin/uclientd
+
+start_service() {
+	procd_open_instance
+	procd_set_param command "$PROG"
+	procd_set_param file /etc/config/clients
+	procd_set_param respawn
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_running() {
+	ubus -t 10 wait_for clients
+}
+
+service_triggers() {
+	procd_add_reload_trigger "clients"
+}
+
+reload_service() {
+	ubus call clients reload
+}
