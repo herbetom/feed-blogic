@@ -250,7 +250,9 @@ function network_extend(network, timeout) {
 	if (!timeout || !active[network].timer)
 		return libubus.STATUS_INVALID_ARGUMENT;
 
-	active[network].timer.set(timeout * 1000);
+	const left = active[network].timer.remaining();
+
+	active[network].timer.set((left > 0 ? left : 0) + timeout * 1000);
 
 	return libubus.STATUS_OK;
 }
