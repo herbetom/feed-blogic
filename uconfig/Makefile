@@ -183,7 +183,7 @@ endef
 
 define Package/uconfig-mod-ieee8021x/install
 	$(INSTALL_DIR) $(1)/usr/share/ucode/uconfig/templates/services/
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/modules/ieee8021x/* $(1)/usr/share/ucode/uconfig/templates/services/
+	$(CP) $(PKG_BUILD_DIR)/modules/ieee8021x/* $(1)/usr/share/ucode/uconfig/templates/services/
 	$(INSTALL_DIR) $(1)/usr/share/ucode/ureader/
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/generated/modules/schemaServiceIeee8021x.uc $(1)/usr/share/ucode/ureader/
 endef
