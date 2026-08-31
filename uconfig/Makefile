@@ -3,7 +3,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=uconfig
 
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=git@github.com:blogic/uconfig.git
+PKG_SOURCE_URL:=https://github.com/blogic/uconfig.git
 PKG_SOURCE_VERSION:=09362f4c27d92e19bcb5f69eb230dd37496bd5ec
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
