@@ -14,7 +14,7 @@ permissions:
 
 env:
   FEEDNAME: blogic
-  PACKAGES:
+  PACKAGES: uconfig
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ github.event.pull_request.number || github.run_id }}
