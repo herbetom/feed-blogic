@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ucode-gps
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=GPL-2.0-only
@@ -12,7 +12,7 @@ define Package/ucode-gps
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=NMEA GPS daemon
-  DEPENDS:=+ucode +ucode-mod-tty +ucode-mod-ubus +ucode-mod-uloop +ucode-mod-log
+  DEPENDS:=+ucode +ucode-mod-serial +ucode-mod-io +ucode-mod-ubus +ucode-mod-uloop +ucode-mod-log
   CONFLICTS:=ugps
 endef
 
