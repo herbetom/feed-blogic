@@ -144,13 +144,14 @@ jobs:
         run: "ls -R"
 
       - name: Minio Deploy
-        uses: herbetom/minio-deploy-action@v1
+        uses: herbetom/s3-deploy-action@v2
         if: vars.S3_DEPLOY == '1'
         with:
-          endpoint: ${{ secrets.MINIO_ENDPOINT }}
-          access_key: ${{ secrets.MINIO_ACCESS_KEY }}
-          secret_key: ${{ secrets.MINIO_SECRET_KEY }}
-          bucket: ${{ vars.MINIO_BUCKET }}
+          endpoint: ${{ secrets.S3_ENDPOINT }}
+          access_key: ${{ secrets.S3_ACCESS_KEY }}
+          secret_key: ${{ secrets.S3_SECRET_KEY }}
+          bucket: ${{ vars.S3_BUCKET }}
+          region: ${{ vars.S3_REGION }}
+          mode: 'sync'
           source_dir: 'combined-packages'
           target_dir: '/'
-          extra_args: '--remove'
