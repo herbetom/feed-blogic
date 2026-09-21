@@ -143,7 +143,7 @@ jobs:
       - name: list all files
         run: "ls -R"
 
-      - name: Minio Deploy
+      - name: S3 Deploy
         uses: herbetom/s3-deploy-action@v2
         if: vars.S3_DEPLOY == '1'
         with:
